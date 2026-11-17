@@ -1,1 +1,446 @@
-123
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>九尾狐：回收行動 — SCP 戰術撤離射擊</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d0f11; overflow: hidden; }
+  #wrap { display: flex; align-items: center; justify-content: center; height: 100%; }
+  canvas { width: min(100vw, calc(100vh * 1.6)); height: auto; background: #14171a; cursor: crosshair; display: block; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="960" height="600"></canvas></div>
+<script>
+(() => {
+'use strict';
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = 960, H = 600, WW = 1800, WH = 1200;
+const FONT = '"Noto Sans TC","Microsoft JhengHei","PingFang TC",sans-serif';
+const C = { floor:'#14171a', grid:'#1b2024', wall:'#2f373d', wallTop:'#434d55', text:'#d7dbd2',
+            amber:'#e0a526', red:'#c4412f', green:'#5fb37c', dim:'#8a9189' };
+const CONE = 0.62;                // half-angle of flashlight = player's field of view (rad)
+const SPAWN = { x: 90, y: 1100 }; // infiltration and extraction point
+
+const light = document.createElement('canvas'); light.width = W; light.height = H;
+const lx = light.getContext('2d');
+
+/* ---------- Map ---------- */
+const walls = [
+  [0,0,1800,20],[0,1180,1800,20],[0,0,20,1200],[1780,0,20,1200],
+  [600,20,20,180],[600,320,20,480],[600,920,20,260],
+  [1200,20,20,480],[1200,620,20,360],[1200,1100,20,80],
+  [20,600,230,20],[370,600,230,20],
+  [620,400,230,20],[970,400,230,20],
+  [1220,700,180,20],[1520,700,260,20],
+  [300,200,60,60],[900,200,80,50],[900,800,60,100],[1500,300,70,70],[1400,950,100,60],[200,900,60,60]
+].map(([x,y,w,h]) => ({x,y,w,h}));
+
+function pointInWall(x, y) {
+  for (const w of walls) if (x >= w.x && x <= w.x+w.w && y >= w.y && y <= w.y+w.h) return true;
+  return false;
+}
+function hitWall(x, y, r) {
+  for (const w of walls) {
+    const cx = Math.max(w.x, Math.min(x, w.x+w.w)), cy = Math.max(w.y, Math.min(y, w.y+w.h));
+    const dx = x-cx, dy = y-cy;
+    if (dx*dx + dy*dy < r*r) return true;
+  }
+  return false;
+}
+function move(e, dx, dy) {
+  if (!hitWall(e.x+dx, e.y, e.r)) e.x += dx;
+  if (!hitWall(e.x, e.y+dy, e.r)) e.y += dy;
+}
+function los(a, b) {
+  const dx = b.x-a.x, dy = b.y-a.y, n = Math.ceil(Math.hypot(dx, dy)/10);
+  for (let i = 1; i < n; i++) if (pointInWall(a.x+dx*i/n, a.y+dy*i/n)) return false;
+  return true;
+}
+const angDiff = (a, b) => { let d = a-b; while (d > Math.PI) d -= 2*Math.PI; while (d < -Math.PI) d += 2*Math.PI; return d; };
+const rnd = (a, b) => a + Math.random()*(b-a);
+
+/* ---------- Input ---------- */
+const keys = {}, mouse = { x: W/2, y: H/2, down: false };
+let state = 'title', G;
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Enter' && state !== 'play') { reset(); state = 'play'; }
+  if (e.code === 'KeyR' && state === 'play') startReload();
+  if (['Space','ArrowUp','ArrowDown'].includes(e.code)) e.preventDefault();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+cv.addEventListener('mousemove', e => {
+  const r = cv.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) * W / r.width; mouse.y = (e.clientY - r.top) * H / r.height;
+});
+cv.addEventListener('mousedown', () => { mouse.down = true; });
+addEventListener('mouseup', () => { mouse.down = false; });
+cv.addEventListener('contextmenu', e => e.preventDefault());
+
+/* ---------- Game state ---------- */
+function reset() {
+  const homes = [[400,300],[300,500],[800,200],[900,600],[1000,900],[1350,200],[1500,500],[1600,850],[1450,1050],[700,1050],[1620,220]];
+  G = {
+    t: 0, kills: 0, shots: 0, flash: 0, hurt: 0, msg: '', msgT: 0, reason: '',
+    cam: { x: 0, y: WH-H },
+    p: { x: SPAWN.x, y: SPAWN.y, r: 12, hp: 100, ang: 0, ammo: 30, res: 90, reload: 0, cool: 0, stepT: 0, hasItem: false },
+    grunts: homes.map(([x,y]) => ({ x, y, hx: x, hy: y, tx: x, ty: y, r: 12, hp: 40, ang: rnd(0,6.28), state: 'idle',
+                                    cool: rnd(0.6,1.2), lost: 0, wait: rnd(0,2), lx: x, ly: y, dir: Math.random()<.5?1:-1 })),
+    s173: { x: 1000, y: 650, r: 14, active: false, seen: false },
+    item: { x: 1660, y: 110, taken: false },
+    bullets: [], eb: [], drops: [], sparks: [],
+    blink: { timer: 5, closed: 0 }
+  };
+  say('潛入設施，回收收容品 SCP-███。', 4);
+}
+function say(t, s = 3) { G.msg = t; G.msgT = s; }
+function spark(x, y, n, c = '#d9cfa5') {
+  for (let i = 0; i < n; i++) G.sparks.push({ x, y, vx: rnd(-90,90), vy: rnd(-90,90), life: rnd(.15,.4), c });
+}
+function makeNoise(x, y, r) {
+  for (const e of G.grunts) {
+    if (e.hp > 0 && e.state !== 'attack' && Math.hypot(e.x-x, e.y-y) < r) { e.state = 'alert'; e.lx = x; e.ly = y; }
+  }
+}
+function startReload() {
+  const p = G.p;
+  if (p.reload <= 0 && p.ammo < 30 && p.res > 0) p.reload = 1.4;
+}
+function die(reason) { G.reason = reason; state = 'dead'; }
+
+/* ---------- Update ---------- */
+function stepTo(e, x, y, sp, dt) {
+  const dx = x-e.x, dy = y-e.y, d = Math.hypot(dx, dy);
+  if (d < 4) return;
+  move(e, dx/d*sp*dt, dy/d*sp*dt); e.ang = Math.atan2(dy, dx);
+}
+function stepBullet(b, dt, hit) {
+  const n = Math.max(1, Math.ceil(Math.hypot(b.vx, b.vy)*dt/6));
+  const sx = b.vx*dt/n, sy = b.vy*dt/n;
+  for (let i = 0; i < n && b.life > 0; i++) {
+    b.x += sx; b.y += sy;
+    if (pointInWall(b.x, b.y)) { b.life = 0; spark(b.x, b.y, 4); break; }
+    if (hit(b)) break;
+  }
+  b.life -= dt;
+}
+function killGrunt(e) {
+  G.kills++;
+  const r = Math.random();
+  if (r < .5) G.drops.push({ x: e.x, y: e.y, t: 'ammo' });
+  else if (r < .72) G.drops.push({ x: e.x, y: e.y, t: 'med' });
+}
+function updGrunt(e, dt) {
+  const p = G.p, dx = p.x-e.x, dy = p.y-e.y, d = Math.hypot(dx, dy);
+  const sees = d < 470 && los(e, p);
+  if (sees) { e.state = 'attack'; e.lost = 0; e.lx = p.x; e.ly = p.y; }
+  else if (e.state === 'attack') { e.lost += dt; if (e.lost > 1.2) e.state = 'alert'; }
+  e.cool -= dt;
+  if (e.state === 'attack') {
+    if (sees) {
+      if (d > 230) stepTo(e, p.x, p.y, 85, dt);
+      else if (d < 150) stepTo(e, e.x-dx, e.y-dy, 70, dt);
+      else move(e, -dy/d*45*e.dir*dt, dx/d*45*e.dir*dt);
+      e.ang = Math.atan2(dy, dx);
+      if (e.cool <= 0) {
+        const a = e.ang + rnd(-.11, .11);
+        G.eb.push({ x: e.x+Math.cos(a)*14, y: e.y+Math.sin(a)*14, vx: Math.cos(a)*430, vy: Math.sin(a)*430, life: 1.6 });
+        e.cool = rnd(.7, 1.2);
+      }
+    } else stepTo(e, e.lx, e.ly, 90, dt);
+  } else if (e.state === 'alert') {
+    stepTo(e, e.lx, e.ly, 105, dt);
+    if (Math.hypot(e.lx-e.x, e.ly-e.y) < 20) { e.state = 'idle'; e.wait = 1.5; }
+  } else {
+    e.wait -= dt;
+    if (e.wait <= 0) { e.tx = e.hx + rnd(-120,120); e.ty = e.hy + rnd(-120,120); e.wait = rnd(2,5); }
+    stepTo(e, e.tx, e.ty, 45, dt);
+  }
+}
+
+function update(dt) {
+  const g = G, p = g.p, cam = g.cam;
+  g.t += dt;
+  if (g.msgT > 0) g.msgT -= dt;
+  if (g.flash > 0) g.flash -= dt;
+  if (g.hurt > 0) g.hurt -= dt;
+
+  // Blink (SCP-173 can move while you blink)
+  g.blink.timer -= dt;
+  if (g.blink.timer <= 0) { g.blink.closed = 0.3; g.blink.timer = 5.5; }
+  if (g.blink.closed > 0) g.blink.closed -= dt;
+  const blinking = g.blink.closed > 0;
+
+  // Player movement
+  const mx = (keys.KeyD?1:0) - (keys.KeyA?1:0), my = (keys.KeyS?1:0) - (keys.KeyW?1:0);
+  const quiet = keys.ShiftLeft || keys.ShiftRight;
+  if (mx || my) {
+    const l = Math.hypot(mx, my), sp = quiet ? 95 : 190;
+    move(p, mx/l*sp*dt, my/l*sp*dt);
+    if (!quiet) { p.stepT -= dt; if (p.stepT <= 0) { p.stepT = .45; makeNoise(p.x, p.y, 320); } }
+  }
+  p.ang = Math.atan2(mouse.y + cam.y - p.y, mouse.x + cam.x - p.x);
+
+  // Shooting
+  p.cool -= dt;
+  if (p.reload > 0) {
+    p.reload -= dt;
+    if (p.reload <= 0) { const take = Math.min(30-p.ammo, p.res); p.ammo += take; p.res -= take; }
+  }
+  if (mouse.down && p.cool <= 0 && p.reload <= 0) {
+    if (p.ammo > 0) {
+      const a = p.ang + rnd(-.025, .025);
+      g.bullets.push({ x: p.x+Math.cos(a)*16, y: p.y+Math.sin(a)*16, vx: Math.cos(a)*950, vy: Math.sin(a)*950, life: .9 });
+      p.ammo--; p.cool = .1; g.flash = .05; g.shots++;
+      makeNoise(p.x, p.y, 650);
+    } else if (p.res > 0) startReload();
+  }
+
+  // Player bullets
+  for (const b of g.bullets) {
+    stepBullet(b, dt, b => {
+      for (const e of g.grunts) {
+        if (e.hp > 0 && Math.hypot(e.x-b.x, e.y-b.y) < e.r+2) {
+          e.hp -= 20; b.life = 0; spark(b.x, b.y, 5, C.red);
+          if (e.state !== 'attack') { e.state = 'alert'; e.lx = p.x; e.ly = p.y; }
+          if (e.hp <= 0) killGrunt(e);
+          return true;
+        }
+      }
+      const s = g.s173;
+      if (Math.hypot(s.x-b.x, s.y-b.y) < s.r+2) { b.life = 0; spark(b.x, b.y, 4, '#bdb59f'); return true; }
+      return false;
+    });
+  }
+  g.bullets = g.bullets.filter(b => b.life > 0);
+  g.grunts = g.grunts.filter(e => e.hp > 0);
+
+  // Grunts
+  for (const e of g.grunts) updGrunt(e, dt);
+
+  // Enemy bullets
+  for (const b of g.eb) {
+    stepBullet(b, dt, b => {
+      if (Math.hypot(p.x-b.x, p.y-b.y) < p.r+2) {
+        p.hp -= 7; g.hurt = .2; b.life = 0; spark(b.x, b.y, 3, C.red);
+        if (p.hp <= 0) die('你被混沌者聯盟擊倒了。');
+        return true;
+      }
+      return false;
+    });
+  }
+  g.eb = g.eb.filter(b => b.life > 0);
+
+  // SCP-173: moves only when you are not looking at it
+  const s = g.s173, sdx = p.x-s.x, sdy = p.y-s.y, sd = Math.hypot(sdx, sdy);
+  if (!s.active && (sd < 800 || p.hasItem)) { s.active = true; say('SCP-173 被驚動了。別讓它離開你的視線。', 4); }
+  const toS = Math.atan2(s.y-p.y, s.x-p.x);
+  s.seen = !blinking && sd < 540 && Math.abs(angDiff(toS, p.ang)) < CONE && los(p, s);
+  if (s.active && !s.seen) move(s, sdx/sd*165*dt, sdy/sd*165*dt);
+  if (s.active && sd < p.r + s.r + 6) die('SCP-173 扭斷了你的頸部。你在眨眼的瞬間失去了它。');
+
+  // Pickups
+  const it = g.item;
+  if (!it.taken && Math.hypot(p.x-it.x, p.y-it.y) < 32) {
+    it.taken = true; p.hasItem = true; say('已回收 SCP-███。返回撤離點！', 4);
+    for (const e of g.grunts) if (e.state === 'idle') { e.state = 'alert'; e.lx = it.x; e.ly = it.y; }
+  }
+  g.drops = g.drops.filter(d => {
+    if (Math.hypot(p.x-d.x, p.y-d.y) < 22) {
+      if (d.t === 'ammo') { p.res += 30; say('+30 備彈', 1.5); }
+      else { p.hp = Math.min(100, p.hp+30); say('+30 生命', 1.5); }
+      return false;
+    }
+    return true;
+  });
+  if (p.hasItem && Math.hypot(p.x-SPAWN.x, p.y-SPAWN.y) < 60) state = 'win';
+
+  // Sparks
+  for (const q of g.sparks) { q.x += q.vx*dt; q.y += q.vy*dt; q.life -= dt; }
+  g.sparks = g.sparks.filter(q => q.life > 0);
+
+  // Camera
+  cam.x = Math.max(0, Math.min(WW-W, p.x-W/2));
+  cam.y = Math.max(0, Math.min(WH-H, p.y-H/2));
+}
+
+/* ---------- Draw ---------- */
+function txt(s, x, y, size, color, align = 'left', bold = false) {
+  ctx.font = (bold ? 'bold ' : '') + size + 'px ' + FONT;
+  ctx.fillStyle = color; ctx.textAlign = align; ctx.textBaseline = 'alphabetic';
+  ctx.fillText(s, x, y);
+}
+
+function drawWorld() {
+  const g = G, p = g.p, cam = g.cam;
+  ctx.fillStyle = C.floor; ctx.fillRect(0, 0, W, H);
+  ctx.save(); ctx.translate(-cam.x, -cam.y);
+
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath();
+  for (let x = 0; x <= WW; x += 100) { ctx.moveTo(x, 0); ctx.lineTo(x, WH); }
+  for (let y = 0; y <= WH; y += 100) { ctx.moveTo(0, y); ctx.lineTo(WW, y); }
+  ctx.stroke();
+
+  // Extraction zone
+  ctx.beginPath(); ctx.arc(SPAWN.x, SPAWN.y, 60, 0, 7);
+  ctx.fillStyle = p.hasItem ? 'rgba(95,179,124,.28)' : 'rgba(138,145,137,.12)'; ctx.fill();
+  ctx.strokeStyle = p.hasItem ? C.green : C.dim; ctx.lineWidth = 2; ctx.stroke();
+
+  // Walls
+  for (const w of walls) {
+    ctx.fillStyle = C.wall; ctx.fillRect(w.x, w.y, w.w, w.h);
+    ctx.fillStyle = C.wallTop; ctx.fillRect(w.x, w.y, w.w, 3);
+  }
+
+  // Objective
+  if (!g.item.taken) {
+    const pulse = 1 + Math.sin(g.t*4)*.15, it = g.item;
+    ctx.save(); ctx.translate(it.x, it.y); ctx.rotate(Math.PI/4); ctx.scale(pulse, pulse);
+    ctx.fillStyle = C.amber; ctx.fillRect(-9, -9, 18, 18);
+    ctx.strokeStyle = 'rgba(224,165,38,.5)'; ctx.lineWidth = 2; ctx.strokeRect(-15, -15, 30, 30);
+    ctx.restore();
+  }
+
+  // Drops
+  for (const d of g.drops) {
+    ctx.fillStyle = d.t === 'ammo' ? C.amber : C.green; ctx.fillRect(d.x-7, d.y-7, 14, 14);
+    ctx.fillStyle = '#111'; ctx.fillRect(d.x-1.5, d.y-5, 3, 10); ctx.fillRect(d.x-5, d.y-1.5, 10, 3);
+  }
+
+  // Grunts
+  for (const e of g.grunts) {
+    ctx.fillStyle = '#6b3a35'; ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, 7); ctx.fill();
+    ctx.strokeStyle = '#2a1512'; ctx.lineWidth = 3; ctx.beginPath();
+    ctx.moveTo(e.x, e.y); ctx.lineTo(e.x+Math.cos(e.ang)*20, e.y+Math.sin(e.ang)*20); ctx.stroke();
+    if (e.state === 'alert') txt('?', e.x, e.y-18, 16, C.amber, 'center', true);
+    if (e.state === 'attack') txt('!', e.x, e.y-18, 16, C.red, 'center', true);
+  }
+
+  // SCP-173
+  const s = g.s173;
+  ctx.fillStyle = '#a39a85'; ctx.fillRect(s.x-13, s.y-13, 26, 26);
+  ctx.fillStyle = '#6f4a3a'; ctx.fillRect(s.x-13, s.y+2, 26, 6);
+  ctx.fillStyle = '#2a1a14'; ctx.fillRect(s.x-8, s.y-7, 5, 5); ctx.fillRect(s.x+3, s.y-7, 5, 5);
+
+  // Player
+  ctx.fillStyle = '#8fb0a0'; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+  ctx.strokeStyle = '#1d2a25'; ctx.lineWidth = 4; ctx.beginPath();
+  ctx.moveTo(p.x, p.y); ctx.lineTo(p.x+Math.cos(p.ang)*22, p.y+Math.sin(p.ang)*22); ctx.stroke();
+  if (g.flash > 0) {
+    ctx.strokeStyle = '#fff3b0'; ctx.lineWidth = 3; ctx.beginPath();
+    ctx.moveTo(p.x+Math.cos(p.ang)*22, p.y+Math.sin(p.ang)*22);
+    ctx.lineTo(p.x+Math.cos(p.ang)*34, p.y+Math.sin(p.ang)*34); ctx.stroke();
+  }
+
+  // Sparks
+  for (const q of g.sparks) { ctx.fillStyle = q.c; ctx.fillRect(q.x-1, q.y-1, 2, 2); }
+  ctx.restore();
+}
+
+function drawDarkness() {
+  const g = G, p = g.p, cam = g.cam, sx = p.x-cam.x, sy = p.y-cam.y;
+  lx.globalCompositeOperation = 'source-over'; lx.clearRect(0, 0, W, H);
+  lx.fillStyle = 'rgba(2,3,4,.93)'; lx.fillRect(0, 0, W, H);
+  lx.globalCompositeOperation = 'destination-out';
+  let gr = lx.createRadialGradient(sx, sy, 20, sx, sy, 540);
+  gr.addColorStop(0, 'rgba(0,0,0,1)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+  lx.fillStyle = gr; lx.beginPath(); lx.moveTo(sx, sy); lx.arc(sx, sy, 540, p.ang-CONE, p.ang+CONE); lx.closePath(); lx.fill();
+  gr = lx.createRadialGradient(sx, sy, 0, sx, sy, 90);
+  gr.addColorStop(0, 'rgba(0,0,0,.9)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+  lx.fillStyle = gr; lx.beginPath(); lx.arc(sx, sy, 90, 0, 7); lx.fill();
+  if (g.flash > 0) {
+    gr = lx.createRadialGradient(sx, sy, 0, sx, sy, 230);
+    gr.addColorStop(0, 'rgba(0,0,0,.7)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+    lx.fillStyle = gr; lx.beginPath(); lx.arc(sx, sy, 230, 0, 7); lx.fill();
+  }
+  ctx.drawImage(light, 0, 0);
+
+  // Tracers stay visible in the dark
+  ctx.save(); ctx.translate(-cam.x, -cam.y);
+  ctx.fillStyle = '#fff3b0'; for (const b of g.bullets) ctx.fillRect(b.x-1.5, b.y-1.5, 3, 3);
+  ctx.fillStyle = '#ff7a5c'; for (const b of g.eb) ctx.fillRect(b.x-2, b.y-2, 4, 4);
+  ctx.restore();
+
+  if (g.blink.closed > 0) { ctx.fillStyle = 'rgba(0,0,0,.92)'; ctx.fillRect(0, 0, W, H); }
+  if (g.hurt > 0) { ctx.fillStyle = 'rgba(196,65,47,' + Math.min(.4, g.hurt*1.6) + ')'; ctx.fillRect(0, 0, W, H); }
+}
+
+function drawHUD() {
+  const g = G, p = g.p;
+  // Health
+  txt('生命', 16, 24, 12, C.dim);
+  ctx.fillStyle = '#23292e'; ctx.fillRect(52, 14, 160, 10);
+  ctx.fillStyle = p.hp > 35 ? C.green : C.red; ctx.fillRect(52, 14, 160*Math.max(0, p.hp)/100, 10);
+  // Ammo
+  txt(p.reload > 0 ? '換彈中…' : p.ammo + ' / ' + p.res, 16, H-18, 22, p.ammo === 0 ? C.red : C.text, 'left', true);
+  txt('彈藥', 16, H-46, 12, C.dim);
+  // Blink
+  const bl = 1 - g.blink.timer/5.5;
+  txt('眨眼', W/2-70, H-18, 12, C.dim, 'right');
+  ctx.fillStyle = '#23292e'; ctx.fillRect(W/2-60, H-28, 120, 10);
+  ctx.fillStyle = bl > .8 ? C.red : C.amber; ctx.fillRect(W/2-60, H-28, 120*bl, 10);
+  // Objective
+  const tgt = p.hasItem ? SPAWN : g.item, dist = Math.round(Math.hypot(tgt.x-p.x, tgt.y-p.y)/20);
+  txt(p.hasItem ? '目標：返回撤離點  ' + dist + ' m' : '目標：回收 SCP-███  ' + dist + ' m', W-16, 24, 14, p.hasItem ? C.green : C.amber, 'right', true);
+  txt('用時 ' + Math.floor(g.t/60) + ':' + String(Math.floor(g.t%60)).padStart(2, '0') + '    擊倒 ' + g.kills, W-16, 44, 12, C.dim, 'right');
+  // 173 status
+  const s = g.s173;
+  const st = !s.active ? '休眠' : s.seen ? '凍結（直視中）' : '移動中！';
+  txt('SCP-173：' + st, W-16, H-18, 14, !s.active ? C.dim : s.seen ? C.green : C.red, 'right', true);
+  txt('視線離開它，它就會動', W-16, H-38, 12, C.dim, 'right');
+  // Message
+  if (g.msgT > 0) txt(g.msg, W/2, 70, 18, C.text, 'center', true);
+}
+
+function overlay(title, color, lines) {
+  ctx.fillStyle = 'rgba(8,10,12,.82)'; ctx.fillRect(0, 0, W, H);
+  txt(title, 80, 120, 40, color, 'left', true);
+  let y = 170;
+  for (const l of lines) {
+    if (l === '') { y += 14; continue; }
+    const head = l.startsWith('#');
+    txt(head ? l.slice(1) : l, 80, y, head ? 15 : 16, head ? C.amber : C.text, 'left', head);
+    y += head ? 28 : 26;
+  }
+}
+
+function draw() {
+  drawWorld(); drawDarkness();
+  if (state === 'play') { drawHUD(); return; }
+  const g = G, acc = g.shots ? '' : '';
+  if (state === 'title') {
+    overlay('九尾狐：回收行動', C.text, [
+      'MTF Epsilon-11「九尾狐」— 異常設施回收任務', '',
+      '#任務',
+      '潛入被破壞的設施外圍，回收收容品 SCP-███，帶回出發點撤離。',
+      '敵方：混沌者聯盟巡邏兵。他們會前來查看槍聲與腳步聲。', '',
+      '#交戰守則',
+      'SCP-173：你的視線離開它，它就會移動。保持直視（手電筒錐形範圍），並留意眨眼。',
+      '不要亂開槍、不要亂跑。按住 Shift 靜步可避免腳步聲。', '',
+      '#操作',
+      'WASD 移動　Shift 靜步　滑鼠 瞄準／射擊　R 換彈', '',
+      '按 Enter 開始'
+    ]);
+  } else if (state === 'dead') {
+    overlay('任務失敗', C.red, [g.reason, '', '用時 ' + Math.round(g.t) + ' 秒　擊倒 ' + g.kills + '　開火 ' + g.shots + ' 發', '', '按 Enter 重新開始']);
+  } else if (state === 'win') {
+    overlay('任務完成', C.green, ['SCP-███ 已安全撤離。', '', '用時 ' + Math.round(g.t) + ' 秒　擊倒 ' + g.kills + '　開火 ' + g.shots + ' 發', '剩餘生命 ' + Math.round(g.p.hp), '', '按 Enter 再玩一次']);
+  }
+}
+
+/* ---------- Loop ---------- */
+reset();
+let last = 0;
+function loop(t) {
+  const dt = Math.min(.05, (t-last)/1000 || 0); last = t;
+  if (state === 'play') update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
